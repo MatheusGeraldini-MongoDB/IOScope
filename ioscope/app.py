@@ -16,6 +16,66 @@ METRIC_COLS = [
     "svctm", "pct_util",
 ]
 
+# Field descriptions based on sar(1) (-b, -d) and related sysstat/iostat docs.
+METRIC_INFO = {
+    "tps": {
+        "menu": "tps — I/O transfers/s",
+        "description": (
+            "Total transfers per second issued to the device. "
+            "A transfer is an I/O request; multiple logical requests may be merged."
+        ),
+    },
+    "rd_sec_s": {
+        "menu": "rd_sec_s — Sectors read/s",
+        "description": (
+            "Sectors read from the device per second. "
+            "Sectors are 512 bytes (equivalent to sar bread/s blocks/s)."
+        ),
+    },
+    "wr_sec_s": {
+        "menu": "wr_sec_s — Sectors written/s",
+        "description": (
+            "Sectors written to the device per second. "
+            "Sectors are 512 bytes (equivalent to sar bwrtn/s blocks/s)."
+        ),
+    },
+    "avrq_sz": {
+        "menu": "avrq_sz — Avg request size",
+        "description": (
+            "Average size of I/O requests issued to the device, in sectors. "
+            "In sar -d this field is now areq-sz (kibibytes); older reports used avgrq-sz."
+        ),
+    },
+    "avgqu_sz": {
+        "menu": "avgqu_sz — Avg queue length",
+        "description": (
+            "Average queue length of requests issued to the device. "
+            "In sar -d this field is now aqu-sz; older reports used avgqu-sz."
+        ),
+    },
+    "await": {
+        "menu": "await — Avg I/O time (ms)",
+        "description": (
+            "Average time in milliseconds for I/O requests to be served, "
+            "including queue wait and service time."
+        ),
+    },
+    "svctm": {
+        "menu": "svctm — Avg service time (ms)",
+        "description": (
+            "Average service time in milliseconds for I/O requests issued to the device. "
+            "Legacy extended iostat field; not shown in current sar(1) reports."
+        ),
+    },
+    "pct_util": {
+        "menu": "pct_util — Device busy %",
+        "description": (
+            "Percentage of elapsed time during which I/O requests were issued to the device. "
+            "Near 100% may indicate saturation on serial devices."
+        ),
+    },
+}
+
 LINE_COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -54,7 +114,15 @@ def metric_device_line_styles(df, metric, devices):
 
 PLOTLY_JS = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
+PLOTLY_CONFIG = {
+    "responsive": True,
+    "displayModeBar": True,
+}
+
 PAGE_STYLE = """
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       margin: 0;
@@ -63,7 +131,7 @@ PAGE_STYLE = """
       color: #1f2933;
     }
     .panel {
-      max-width: 2040px;
+      width: 100%;
       margin: 0 auto;
       background: #fff;
       border: 1px solid #d9dde3;
@@ -128,7 +196,13 @@ PAGE_STYLE = """
       color: #b42318;
     }
     #chart {
+      width: 100%;
       min-height: __CHART_MIN_HEIGHT__px;
+      overflow: hidden;
+    }
+    #chart .plotly-graph-div,
+    #chart .js-plotly-plot {
+      width: 100% !important;
     }
     .placeholder {
       display: grid;
@@ -148,6 +222,16 @@ PAGE_SCRIPT = """
     const renderEndpoint = "__RENDER_ENDPOINT__";
     const storageKey = "ioscope-file-content";
     const storageNameKey = "ioscope-file-name";
+
+    const plotConfig = { responsive: true, displayModeBar: true };
+    let resizeTimer = null;
+
+    function resizeChart() {
+      const chart = document.getElementById("chart");
+      if (chart && chart.data) {
+        Plotly.Plots.resize(chart);
+      }
+    }
 
     function setStatus(message, isError = false) {
       statusEl.textContent = message;
@@ -173,9 +257,15 @@ PAGE_SCRIPT = """
       }
 
       chartEl.innerHTML = "";
-      await Plotly.newPlot("chart", payload.data, payload.layout, payload.config || {responsive: true});
+      await Plotly.newPlot("chart", payload.data, payload.layout, plotConfig);
+      resizeChart();
       setStatus(`Showing ${fileName}`);
     }
+
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(resizeChart, 150);
+    });
 
     fileInput.addEventListener("change", async () => {
       const file = fileInput.files[0];
@@ -352,6 +442,24 @@ def load_iostat_file(path):
         return load_iostat_text(f.read())
 
 
+def metric_menu_label(metric):
+    return METRIC_INFO[metric]["menu"]
+
+
+def metric_description_annotation(metric):
+    return dict(
+        text=METRIC_INFO[metric]["description"],
+        xref="paper",
+        yref="paper",
+        x=0.5,
+        y=1.05,
+        showarrow=False,
+        font=dict(size=11, color="#52606d"),
+        xanchor="center",
+        yanchor="bottom",
+    )
+
+
 def _metric_buttons(total_traces, traces_per_metric, title_for_metric, layout_updates):
     buttons = []
     for i, metric in enumerate(METRIC_COLS):
@@ -360,10 +468,14 @@ def _metric_buttons(total_traces, traces_per_metric, title_for_metric, layout_up
         for j in range(traces_per_metric):
             visible[start + j] = True
 
-        layout_patch = {"title.text": title_for_metric(metric), **layout_updates(metric)}
+        layout_patch = {
+            "title.text": title_for_metric(metric),
+            "annotations": [metric_description_annotation(metric)],
+            **layout_updates(metric),
+        }
         buttons.append(
             dict(
-                label=metric,
+                label=metric_menu_label(metric),
                 method="update",
                 args=[{"visible": visible}, layout_patch],
             )
@@ -392,9 +504,28 @@ def build_heatmap_pivot(df, metric, devices):
 def heatmap_layout_size(devices):
     device_count = len(devices)
     max_label_len = max((len(device) for device in devices), default=6)
-    height = max(920, 180 + device_count * 22)
+    height = max(720, 180 + device_count * 22)
     left_margin = max(120, min(320, 16 + max_label_len * 7))
     return height, left_margin
+
+
+def apply_line_chart_xaxis(fig):
+    fig.update_xaxes(
+        title="Timestamp",
+        tickformat="%b %d %H:%M",
+        tickangle=-45,
+        automargin=True,
+        nticks=12,
+    )
+
+
+def apply_heatmap_xaxis(fig):
+    fig.update_xaxes(
+        title="Timestamp",
+        tickangle=-45,
+        automargin=True,
+        nticks=12,
+    )
 
 
 def build_line_chart(df, machine_name):
@@ -430,14 +561,15 @@ def build_line_chart(df, machine_name):
 
     device_count = len(devices)
     legend_rows = max(1, (device_count + 11) // 12)
-    bottom_margin = 70 + legend_rows * 22
+    bottom_margin = 110 + legend_rows * 22
+    chart_height = 720 + legend_rows * 18
 
     fig.update_layout(
         title={"text": f"{machine_name} - {initial_metric} by device and time"},
-        width=2000,
-        height=820 + legend_rows * 18,
-        margin=dict(t=120, r=40, b=bottom_margin, l=80),
-        xaxis_title="Timestamp",
+        autosize=True,
+        height=chart_height,
+        margin=dict(t=145, r=24, b=bottom_margin, l=80),
+        annotations=[metric_description_annotation(initial_metric)],
         yaxis_title=initial_metric,
         legend=dict(
             title="Device",
@@ -461,13 +593,14 @@ def build_line_chart(df, machine_name):
                 ),
                 direction="down",
                 showactive=True,
-                x=0.5,
-                xanchor="center",
+                x=0,
+                xanchor="left",
                 y=1.02,
                 yanchor="bottom",
             )
         ],
     )
+    apply_line_chart_xaxis(fig)
 
     return fig
 
@@ -502,10 +635,10 @@ def build_heatmap_chart(df, machine_name):
 
     fig.update_layout(
         title={"text": f"{machine_name} - Heatmap of {initial_metric} by device and time"},
-        width=2000,
+        autosize=True,
         height=height,
-        margin=dict(t=120, r=120, b=80, l=left_margin),
-        xaxis_title="Timestamp",
+        margin=dict(t=145, r=24, b=80, l=left_margin),
+        annotations=[metric_description_annotation(initial_metric)],
         yaxis=dict(
             title="Device",
             type="category",
@@ -527,13 +660,14 @@ def build_heatmap_chart(df, machine_name):
                 ),
                 direction="down",
                 showactive=True,
-                x=0.5,
-                xanchor="center",
+                x=0,
+                xanchor="left",
                 y=1.02,
                 yanchor="bottom",
             )
         ],
     )
+    apply_heatmap_xaxis(fig)
 
     return fig
 
@@ -572,6 +706,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
             df, machine_name = load_iostat_text(body)
             fig = builder(df, machine_name)
             payload = json.loads(fig.to_json())
+            payload["config"] = PLOTLY_CONFIG
             self._send_json(payload)
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=400)
