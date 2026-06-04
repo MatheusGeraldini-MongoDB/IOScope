@@ -115,21 +115,3 @@ ioscope/
     └── app.py
 ```
 
-## Notes
-
-- IOScope runs a local web server on port `8765` by default.
-- Data is processed locally in your browser session; files are not uploaded anywhere else.
-- Use the Plotly toolbar on the chart to zoom, pan, or export an image.
-
-## Publishing to GitHub
-
-From the `ioscope` directory:
-
-```bash
-git init
-git add .
-git commit -m "Initial commit: IOScope"
-git branch -M main
-git remote add origin <your-repo-url>
-git push -u origin main
-```
