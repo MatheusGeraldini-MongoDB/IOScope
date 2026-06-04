@@ -1,6 +1,7 @@
 import json
 import re
 import webbrowser
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -368,71 +369,204 @@ HEATMAP_PAGE_HTML = page_html(
 )
 
 
+HEADER_DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
+DEVICE_ROW_RE = re.compile(
+    r"^(\d{1,2}:\d{2}:\d{2}(?:\s+(?:AM|PM))?)\s+(\S+)\s+(.+)$",
+    re.IGNORECASE,
+)
+COLUMN_HEADER_RE = re.compile(r"\b(DEV|Device:?)\b", re.IGNORECASE)
+
+# Map header tokens from iostat/sar reports to internal metric columns.
+METRIC_ALIASES = {
+    "tps": "tps",
+    "rd_sec/s": "rd_sec_s",
+    "wr_sec/s": "wr_sec_s",
+    "rkB/s": "rd_sec_s",
+    "wkB/s": "wr_sec_s",
+    "dkB/s": None,
+    "avrq-sz": "avrq_sz",
+    "areq-sz": "avrq_sz",
+    "avgqu-sz": "avgqu_sz",
+    "aqu-sz": "avgqu_sz",
+    "await": "await",
+    "svctm": "svctm",
+    "pctutil": "pct_util",
+    "%util": "pct_util",
+}
+
+# Backward time jump larger than this (seconds) starts the next calendar day.
+MIDNIGHT_ROLLOVER_SECONDS = 3600
+
+# Fallback column order when no header row is present (value count after device).
+POSITIONAL_LAYOUTS = {
+    8: ["tps", "rd_sec_s", "wr_sec_s", "avrq_sz", "avgqu_sz", "await", "svctm", "pct_util"],
+    9: ["tps", "rd_sec_s", "wr_sec_s", None, "avrq_sz", "avgqu_sz", "await", "pct_util"],
+}
+
+
+def _normalize_metric_name(name):
+    key = name.strip()
+    return METRIC_ALIASES.get(key, METRIC_ALIASES.get(key.lower()))
+
+
+def _parse_file_date(header_text):
+    match = HEADER_DATE_RE.search(header_text)
+    if not match:
+        raise ValueError("Could not find date in file header")
+
+    date_str = match.group(1)
+    for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return pd.to_datetime(date_str, format=fmt).date()
+        except (ValueError, pd.errors.ParserError):
+            continue
+    raise ValueError(f"Could not parse date: {date_str}")
+
+
+def _parse_machine_name(lines):
+    for line in lines[:5]:
+        match = re.search(r"\(([^)]+)\)", line)
+        if match:
+            return match.group(1)
+    raise ValueError("Could not find machine name in file header")
+
+
+def _is_column_header_line(line):
+    return bool(COLUMN_HEADER_RE.search(line)) and re.search(r"\btps\b", line, re.I)
+
+
+def _parse_column_header(line):
+    if not _is_column_header_line(line):
+        return None
+
+    parts = line.split()
+    dev_index = None
+    for index, part in enumerate(parts):
+        if re.fullmatch(r"dev|device:?", part, re.I):
+            dev_index = index
+            break
+    if dev_index is None:
+        return None
+
+    layout = [_normalize_metric_name(name) for name in parts[dev_index + 1:]]
+    return layout if layout else None
+
+
+def _layout_for_values(values, column_layout):
+    if column_layout is not None and len(values) == len(column_layout):
+        return column_layout
+    return POSITIONAL_LAYOUTS.get(len(values))
+
+
+def _parse_device_row(line, column_layout):
+    match = DEVICE_ROW_RE.match(line)
+    if not match:
+        return None
+
+    time_str = re.sub(r"\s+", " ", match.group(1).strip().upper())
+    device = match.group(2)
+    try:
+        values = [float(value) for value in match.group(3).split()]
+    except ValueError:
+        return None
+
+    layout = _layout_for_values(values, column_layout)
+    if layout is None:
+        return None
+
+    metrics = {col: float("nan") for col in METRIC_COLS}
+    for value, col in zip(values, layout):
+        if col:
+            metrics[col] = value
+
+    return {"time": time_str, "device": device, **metrics}
+
+
+def _time_of_day_seconds(time_str):
+    clock = pd.to_datetime(time_str.strip(), format="mixed").time()
+    return clock.hour * 3600 + clock.minute * 60 + clock.second
+
+
+def _try_parse_file_date(line):
+    try:
+        return _parse_file_date(line)
+    except ValueError:
+        return None
+
+
+def _advance_date_on_rollover(current_date, time_str, last_time_str, last_seconds):
+    seconds = _time_of_day_seconds(time_str)
+    if time_str != last_time_str and last_seconds is not None:
+        if seconds + MIDNIGHT_ROLLOVER_SECONDS < last_seconds:
+            current_date = current_date + timedelta(days=1)
+    if time_str != last_time_str:
+        last_seconds = seconds
+        last_time_str = time_str
+    return current_date, last_time_str, last_seconds
+
+
 def load_iostat_text(text):
     lines = [line.rstrip("\n") for line in text.splitlines() if line.strip()]
     if not lines:
         raise ValueError("File is empty")
 
-    header = lines[0]
+    file_date = _parse_file_date(lines[0])
+    machine_name = _parse_machine_name(lines)
 
-    date_match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", header)
-    if not date_match:
-        raise ValueError("Could not find date in first line of file")
-
-    machine_match = re.search(r"\(([^)]+)\)", header)
-    if not machine_match:
-        raise ValueError("Could not find machine name in first line of file")
-
-    machine_name = machine_match.group(1)
-    file_date = pd.to_datetime(date_match.group(1), format="%m/%d/%Y").date()
-
-    pattern = re.compile(
-        r'^(\d{2}:\d{2}:\d{2}\s+[AP]M)\s+'
-        r'(\S+)\s+'
-        r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+'
-        r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)$'
-    )
-
-    rows = []
+    column_layout = None
     for line in lines[1:]:
-        line = line.strip()
+        layout = _parse_column_header(line.strip())
+        if layout:
+            column_layout = layout
+            break
 
-        if (
-            line.startswith("Linux ")
-            or line.startswith("Device")
-            or line.startswith("avg-cpu")
-        ):
+    current_date = file_date
+    last_time_str = None
+    last_seconds = None
+    rows = []
+
+    for line in lines[1:]:
+        stripped = line.strip()
+
+        if stripped.startswith("Linux "):
+            header_date = _try_parse_file_date(stripped)
+            if header_date is not None:
+                current_date = header_date
+                last_time_str = None
+                last_seconds = None
             continue
 
-        m = pattern.match(line)
-        if m:
-            rows.append(m.groups())
+        if (
+            stripped.startswith("avg-cpu")
+            or _is_column_header_line(stripped)
+        ):
+            continue
+        if stripped.startswith("Device") and not _is_column_header_line(stripped):
+            continue
+
+        parsed = _parse_device_row(stripped, column_layout)
+        if not parsed:
+            continue
+
+        time_str = parsed["time"]
+        current_date, last_time_str, last_seconds = _advance_date_on_rollover(
+            current_date, time_str, last_time_str, last_seconds,
+        )
+        parsed["date"] = current_date
+        rows.append(parsed)
 
     if not rows:
         raise ValueError("No iostat device rows found in file")
 
-    cols = [
-        "time", "device", "tps", "rd_sec/s", "wr_sec/s",
-        "avrq-sz", "avgqu-sz", "await", "svctm", "pctutil"
-    ]
-
-    df = pd.DataFrame(rows, columns=cols)
-
+    df = pd.DataFrame(rows)
     df["timestamp"] = pd.to_datetime(
-        str(file_date) + " " + df["time"],
-        format="%Y-%m-%d %I:%M:%S %p"
+        df["date"].astype(str) + " " + df["time"],
+        format="mixed",
     )
+    df = df.drop(columns=["time", "date"])
 
-    for c in cols[2:]:
-        df[c] = pd.to_numeric(df[c])
-
-    df = df.rename(columns={
-        "rd_sec/s": "rd_sec_s",
-        "wr_sec/s": "wr_sec_s",
-        "avrq-sz": "avrq_sz",
-        "avgqu-sz": "avgqu_sz",
-        "pctutil": "pct_util",
-    })
+    for col in METRIC_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df, machine_name
 
