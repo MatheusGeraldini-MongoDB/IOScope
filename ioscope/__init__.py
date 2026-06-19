@@ -1,4 +1,4 @@
-"""IOScope — Disk I/O analysis from iostat logs."""
+"""IOScope — Disk I/O analysis from SAR disk logs."""
 
 __version__ = "1.0.0"
 

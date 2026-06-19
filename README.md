@@ -1,6 +1,6 @@
 # IOScope
 
-Disk I/O analysis from iostat logs. Upload a local iostat text file and explore per-device metrics over time and as a heatmap.
+Disk I/O analysis from SAR disk logs. Upload a local SAR disk log file and explore per-device metrics over time and as a heatmap.
 
 ## Requirements
 
@@ -61,7 +61,7 @@ Disk I/O analysis from iostat logs. Upload a local iostat text file and explore 
    - Metrics over time: [http://127.0.0.1:8765/](http://127.0.0.1:8765/)
    - Heatmap: [http://127.0.0.1:8765/heatmap](http://127.0.0.1:8765/heatmap)
 
-3. Click **Choose File** and select an iostat text file (`.txt`).
+3. Click **Choose File** and select a SAR disk log text file (`.txt`).
 
 4. Use the **metric dropdown** above the chart to switch between:
 
@@ -74,9 +74,11 @@ Disk I/O analysis from iostat logs. Upload a local iostat text file and explore 
    - `svctm`
    - `pct_util`
 
-5. Switch between pages using the navigation links at the top. The selected file is kept in the browser session, so you do not need to re-upload it when moving between views.
+5. Switch between pages using the navigation links at the top. After a successful upload, the log is stored in the browser (**SQLite via sql.js** + **IndexedDB**). Use **Saved logs** to list every stored copy (hostname from the log header is shown with the file name), **Load** to open one without re-uploading, or **Discard** to remove it and free space. On reload, the most recent saved log is opened automatically when available.
 
-6. Stop the server with `Ctrl+C` in the terminal.
+6. The first time you use IOScope, the app loads **sql.js** (~1 MB WASM) and **Plotly** from a CDN; an internet connection is required unless you host those assets yourself.
+
+7. Stop the server with `Ctrl+C` in the terminal.
 
 ## Pages
 
@@ -95,12 +97,12 @@ Disk I/O analysis from iostat logs. Upload a local iostat text file and explore 
 
 ## Input file format
 
-IOScope expects plain-text iostat output with:
+IOScope expects plain-text SAR disk output with:
 
 - A header line containing the machine name in parentheses and a date (`MM/DD/YYYY`)
 - Device rows with timestamp, device name, and metric columns
 
-Use iostat **by-disk** output files (for example, files generated with `sar -d` or `iostat -x`).
+Use **per-device** SAR disk log files (for example, output from `sar -d`).
 
 ## Project structure
 

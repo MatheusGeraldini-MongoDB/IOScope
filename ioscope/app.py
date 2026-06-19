@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 APP_NAME = "IOScope"
-APP_TAGLINE = "Disk I/O analysis from iostat logs"
+APP_TAGLINE = "Disk I/O analysis from SAR disk logs"
 
 METRIC_COLS = [
     "tps", "rd_sec_s", "wr_sec_s",
@@ -17,7 +17,7 @@ METRIC_COLS = [
     "svctm", "pct_util",
 ]
 
-# Field descriptions based on sar(1) (-b, -d) and related sysstat/iostat docs.
+# Field descriptions based on sar(1) (-d) and related sysstat SAR disk docs.
 METRIC_INFO = {
     "tps": {
         "menu": "tps — I/O transfers/s",
@@ -65,7 +65,7 @@ METRIC_INFO = {
         "menu": "svctm — Avg service time (ms)",
         "description": (
             "Average service time in milliseconds for I/O requests issued to the device. "
-            "Legacy extended iostat field; not shown in current sar(1) reports."
+            "Legacy SAR disk metric; not shown in current sar(1) reports."
         ),
     },
     "pct_util": {
@@ -114,6 +114,10 @@ def metric_device_line_styles(df, metric, devices):
     return styles
 
 PLOTLY_JS = "https://cdn.plot.ly/plotly-2.35.2.min.js"
+
+# sql.js (SQLite compiled to WebAssembly); used in the browser for large file persistence.
+SQL_JS_VERSION = "1.12.0"
+SQL_JS_DIST = f"https://cdn.jsdelivr.net/npm/sql.js@{SQL_JS_VERSION}/dist/"
 
 PLOTLY_CONFIG = {
     "responsive": True,
@@ -214,6 +218,64 @@ PAGE_STYLE = """
       color: #7b8794;
       background: #fafbfc;
     }
+    .local-db-panel {
+      margin-top: 8px;
+      margin-bottom: 16px;
+      padding: 14px 16px;
+      border: 1px solid #d9dde3;
+      border-radius: 8px;
+      background: #fafbfc;
+    }
+    .local-db-heading {
+      margin: 0 0 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      color: #243b53;
+    }
+    .local-db-hint {
+      margin: 0 0 12px;
+      font-size: 0.88rem;
+      color: #52606d;
+    }
+    .local-db-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .local-db-row label {
+      font-size: 0.92rem;
+      color: #334e68;
+    }
+    #saved-list {
+      flex: 1 1 220px;
+      min-width: 200px;
+      max-width: 100%;
+      padding: 6px 8px;
+      font-size: 0.92rem;
+      border-radius: 6px;
+      border: 1px solid #cbd2d9;
+    }
+    .local-db-row button {
+      padding: 6px 12px;
+      font-size: 0.9rem;
+      border-radius: 6px;
+      border: 1px solid #cbd2d9;
+      background: #fff;
+      color: #334e68;
+      cursor: pointer;
+    }
+    .local-db-row button:hover {
+      background: #f0f4f8;
+    }
+    .local-db-row button.danger {
+      border-color: #e8a4a4;
+      color: #b42318;
+      background: #fff5f5;
+    }
+    .local-db-row button.danger:hover {
+      background: #fde8e8;
+    }
 """
 
 PAGE_SCRIPT = """
@@ -221,11 +283,190 @@ PAGE_SCRIPT = """
     const statusEl = document.getElementById("status");
     const chartEl = document.getElementById("chart");
     const renderEndpoint = "__RENDER_ENDPOINT__";
-    const storageKey = "ioscope-file-content";
-    const storageNameKey = "ioscope-file-name";
+    const sqlJsDist = "__SQL_JS_DIST__";
+    /** Clear legacy sessionStorage keys from older IOScope versions. */
+    const legacyContentKey = "ioscope-file-content";
+    const legacyNameKey = "ioscope-file-name";
+
+    const idbName = "ioscope-sql-wasm";
+    const idbStore = "snapshots";
+    const idbKey = "file-db";
 
     const plotConfig = { responsive: true, displayModeBar: true };
     let resizeTimer = null;
+    let sqlDb = null;
+    let sqlDbOpenPromise = null;
+
+    function idbOpen() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(idbName, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(idbStore)) {
+            db.createObjectStore(idbStore);
+          }
+        };
+        req.onerror = () => reject(req.error);
+        req.onsuccess = () => resolve(req.result);
+      });
+    }
+
+    async function idbGetSnapshot() {
+      const db = await idbOpen();
+      return new Promise((resolve, reject) => {
+        let result = null;
+        const tx = db.transaction(idbStore, "readonly");
+        const getReq = tx.objectStore(idbStore).get(idbKey);
+        getReq.onsuccess = () => {
+          result = getReq.result || null;
+        };
+        getReq.onerror = () => reject(getReq.error);
+        tx.oncomplete = () => {
+          db.close();
+          resolve(result);
+        };
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    async function idbPutSnapshot(data) {
+      const db = await idbOpen();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(idbStore, "readwrite");
+        tx.objectStore(idbStore).put(data, idbKey);
+        tx.oncomplete = () => {
+          db.close();
+          resolve();
+        };
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    async function migrateSchemaIfNeeded(db) {
+      db.run(`CREATE TABLE IF NOT EXISTS saved_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name TEXT NOT NULL,
+        file_content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        host_name TEXT NOT NULL DEFAULT ''
+      );`);
+      const legacy = db.exec(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='current_file'",
+      );
+      let migrated = false;
+      if (legacy.length > 0 && legacy[0].values.length > 0) {
+        const rows = db.exec("SELECT file_name, file_content FROM current_file WHERE id = 1");
+        if (rows.length > 0 && rows[0].values.length > 0) {
+          const fn = rows[0].values[0][0];
+          const fc = rows[0].values[0][1];
+          db.run(
+            "INSERT INTO saved_files (file_name, file_content, created_at, host_name) VALUES (?, ?, datetime('now'), '')",
+            [fn, fc],
+          );
+        }
+        db.run("DROP TABLE IF EXISTS current_file");
+        migrated = true;
+      }
+      let needsPersist = migrated;
+      const info = db.exec("PRAGMA table_info(saved_files)");
+      if (info.length > 0 && info[0].values) {
+        const colNames = info[0].values.map((row) => row[1]);
+        if (!colNames.includes("host_name")) {
+          db.run("ALTER TABLE saved_files ADD COLUMN host_name TEXT NOT NULL DEFAULT ''");
+          needsPersist = true;
+        }
+      }
+      if (needsPersist) {
+        await idbPutSnapshot(db.export());
+      }
+    }
+
+    async function ensureSqlDatabase() {
+      if (sqlDb) {
+        return sqlDb;
+      }
+      if (!sqlDbOpenPromise) {
+        sqlDbOpenPromise = (async () => {
+          try {
+            const SQL = await initSqlJs({ locateFile: (file) => sqlJsDist + file });
+            const bytes = await idbGetSnapshot();
+            const db = bytes && bytes.byteLength ? new SQL.Database(bytes) : new SQL.Database();
+            await migrateSchemaIfNeeded(db);
+            sqlDb = db;
+            return db;
+          } catch (err) {
+            sqlDbOpenPromise = null;
+            sqlDb = null;
+            throw err;
+          }
+        })();
+      }
+      return sqlDbOpenPromise;
+    }
+
+    async function persistDbToIdb() {
+      const exported = sqlDb.export();
+      await idbPutSnapshot(exported);
+    }
+
+    async function insertSavedFile(name, text, hostName) {
+      await ensureSqlDatabase();
+      const host = hostName && String(hostName).trim() ? String(hostName).trim() : "";
+      sqlDb.run(
+        "INSERT INTO saved_files (file_name, file_content, created_at, host_name) VALUES (?, ?, datetime('now'), ?)",
+        [name, text, host],
+      );
+      await persistDbToIdb();
+    }
+
+    async function deleteSavedFile(id) {
+      await ensureSqlDatabase();
+      sqlDb.run("DELETE FROM saved_files WHERE id = ?", [id]);
+      await persistDbToIdb();
+    }
+
+    async function getSavedFileById(id) {
+      await ensureSqlDatabase();
+      const stmt = sqlDb.prepare(
+        "SELECT file_name AS n, file_content AS t FROM saved_files WHERE id = ?",
+      );
+      stmt.bind([id]);
+      if (!stmt.step()) {
+        stmt.free();
+        return null;
+      }
+      const row = stmt.getAsObject();
+      stmt.free();
+      if (!row.t) {
+        return null;
+      }
+      return { name: row.n, text: row.t };
+    }
+
+    async function refreshSavedList() {
+      const sel = document.getElementById("saved-list");
+      if (!sel) {
+        return;
+      }
+      await ensureSqlDatabase();
+      sel.innerHTML = '<option value="">— Select a saved log —</option>';
+      const stmt = sqlDb.prepare(
+        "SELECT id, file_name, host_name, created_at, length(file_content) AS nbytes FROM saved_files ORDER BY id DESC",
+      );
+      while (stmt.step()) {
+        const r = stmt.getAsObject();
+        const mib = (r.nbytes / (1024 * 1024)).toFixed(2);
+        const hostPart =
+          r.host_name && String(r.host_name).trim()
+            ? String(r.host_name).trim() + " · "
+            : "";
+        const opt = document.createElement("option");
+        opt.value = String(r.id);
+        opt.textContent = hostPart + r.file_name + " · " + r.created_at + " · " + mib + " MiB";
+        sel.appendChild(opt);
+      }
+      stmt.free();
+    }
 
     function resizeChart() {
       const chart = document.getElementById("chart");
@@ -239,7 +480,7 @@ PAGE_SCRIPT = """
       statusEl.classList.toggle("error", isError);
     }
 
-    function showPlaceholder(message = "Select an iostat file to begin.") {
+    function showPlaceholder(message = "Select a SAR disk log file to begin.") {
       chartEl.innerHTML = `<div class="placeholder">${message}</div>`;
     }
 
@@ -260,7 +501,14 @@ PAGE_SCRIPT = """
       chartEl.innerHTML = "";
       await Plotly.newPlot("chart", payload.data, payload.layout, plotConfig);
       resizeChart();
-      setStatus(`Showing ${fileName}`);
+      const machineName =
+        typeof payload.machine_name === "string" ? payload.machine_name.trim() : "";
+      setStatus(
+        machineName
+          ? `Showing ${fileName} (${machineName})`
+          : `Showing ${fileName}`,
+      );
+      return machineName;
     }
 
     window.addEventListener("resize", () => {
@@ -278,24 +526,90 @@ PAGE_SCRIPT = """
 
       try {
         const fileText = await file.text();
-        sessionStorage.setItem(storageKey, fileText);
-        sessionStorage.setItem(storageNameKey, file.name);
-        await renderChart(fileText, file.name);
+        const machineName = await renderChart(fileText, file.name);
+        try {
+          await insertSavedFile(file.name, fileText, machineName);
+          await refreshSavedList();
+          const sel = document.getElementById("saved-list");
+          if (sel && sel.options.length > 1) {
+            sel.selectedIndex = 1;
+          }
+        } catch (persistErr) {
+          setStatus(
+            `Showing ${file.name} (could not save offline copy: ${persistErr.message})`,
+            false,
+          );
+        }
       } catch (error) {
         showPlaceholder();
         setStatus(error.message, true);
       }
     });
 
-    window.addEventListener("DOMContentLoaded", async () => {
-      const cachedText = sessionStorage.getItem(storageKey);
-      const cachedName = sessionStorage.getItem(storageNameKey);
-      if (!cachedText || !cachedName) {
+    document.getElementById("load-saved-btn").addEventListener("click", async () => {
+      const sel = document.getElementById("saved-list");
+      const id = sel && sel.value ? Number(sel.value) : NaN;
+      if (!id) {
+        setStatus("Choose a saved log from the list first.", true);
         return;
       }
-
       try {
-        await renderChart(cachedText, cachedName);
+        const snap = await getSavedFileById(id);
+        if (!snap) {
+          setStatus("That saved log is missing; try Refresh list.", true);
+          await refreshSavedList();
+          return;
+        }
+        await renderChart(snap.text, snap.name);
+      } catch (error) {
+        showPlaceholder();
+        setStatus(error.message, true);
+      }
+    });
+
+    document.getElementById("discard-saved-btn").addEventListener("click", async () => {
+      const sel = document.getElementById("saved-list");
+      const id = sel && sel.value ? Number(sel.value) : NaN;
+      if (!id) {
+        setStatus("Choose a saved log to discard.", true);
+        return;
+      }
+      if (!confirm("Remove this saved log from the browser database?")) {
+        return;
+      }
+      try {
+        await deleteSavedFile(id);
+        await refreshSavedList();
+        sel.value = "";
+        setStatus("Saved log removed.");
+        showPlaceholder("Select a SAR disk log file or load a saved log.");
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    });
+
+    document.getElementById("refresh-saved-btn").addEventListener("click", async () => {
+      try {
+        await refreshSavedList();
+        setStatus("Saved logs list updated.");
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    });
+
+    window.addEventListener("DOMContentLoaded", async () => {
+      try {
+        sessionStorage.removeItem(legacyContentKey);
+        sessionStorage.removeItem(legacyNameKey);
+        await refreshSavedList();
+        const sel = document.getElementById("saved-list");
+        if (sel && sel.options.length > 1) {
+          sel.selectedIndex = 1;
+          const snap = await getSavedFileById(Number(sel.value));
+          if (snap) {
+            await renderChart(snap.text, snap.name);
+          }
+        }
       } catch (error) {
         showPlaceholder();
         setStatus(error.message, true);
@@ -317,6 +631,7 @@ def page_html(title, page_heading, subtitle, active_nav, render_endpoint, chart_
     script = (
         PAGE_SCRIPT
         .replace("__RENDER_ENDPOINT__", render_endpoint)
+        .replace("__SQL_JS_DIST__", SQL_JS_DIST)
     )
 
     return f"""<!DOCTYPE html>
@@ -325,6 +640,7 @@ def page_html(title, page_heading, subtitle, active_nav, render_endpoint, chart_
   <meta charset="utf-8">
   <title>{title}</title>
   <script src="{PLOTLY_JS}"></script>
+  <script src="{SQL_JS_DIST}sql-wasm.js"></script>
   <style>{style}
   </style>
 </head>
@@ -339,9 +655,22 @@ def page_html(title, page_heading, subtitle, active_nav, render_endpoint, chart_
     <div class="controls">
       <input id="file-input" type="file" accept=".txt,text/plain">
     </div>
+    <div class="local-db-panel">
+      <h2 class="local-db-heading">Saved logs (browser database)</h2>
+      <p class="local-db-hint">Each successful upload is stored locally. Pick one to reload it, or discard it to free space.</p>
+      <div class="local-db-row">
+        <label for="saved-list">Saved</label>
+        <select id="saved-list" aria-label="Saved SAR disk logs">
+          <option value="">— Select a saved log —</option>
+        </select>
+        <button type="button" id="load-saved-btn">Load</button>
+        <button type="button" id="discard-saved-btn" class="danger">Discard</button>
+        <button type="button" id="refresh-saved-btn">Refresh list</button>
+      </div>
+    </div>
     <div id="status">No file selected.</div>
     <div id="chart">
-      <div class="placeholder">Select an iostat file to begin.</div>
+      <div class="placeholder">Select a SAR disk log file to begin.</div>
     </div>
   </div>
   <script>{script}
@@ -353,7 +682,7 @@ def page_html(title, page_heading, subtitle, active_nav, render_endpoint, chart_
 LINES_PAGE_HTML = page_html(
     title=f"{APP_NAME} — Metrics Over Time",
     page_heading="Metrics Over Time by Device",
-    subtitle="Upload an iostat file to explore per-device metric trends.",
+    subtitle="Upload a SAR disk log file to explore per-device metric trends.",
     active_nav="lines",
     render_endpoint="/api/render/lines",
     chart_min_height=900,
@@ -362,7 +691,7 @@ LINES_PAGE_HTML = page_html(
 HEATMAP_PAGE_HTML = page_html(
     title=f"{APP_NAME} — Heatmap",
     page_heading="Device Heatmap",
-    subtitle="Upload an iostat file to explore device activity over time.",
+    subtitle="Upload a SAR disk log file to explore device activity over time.",
     active_nav="heatmap",
     render_endpoint="/api/render/heatmap",
     chart_min_height=1100,
@@ -376,7 +705,7 @@ DEVICE_ROW_RE = re.compile(
 )
 COLUMN_HEADER_RE = re.compile(r"\b(DEV|Device:?)\b", re.IGNORECASE)
 
-# Map header tokens from iostat/sar reports to internal metric columns.
+# Map header tokens from SAR disk reports to internal metric columns.
 METRIC_ALIASES = {
     "tps": "tps",
     "rd_sec/s": "rd_sec_s",
@@ -505,7 +834,7 @@ def _advance_date_on_rollover(current_date, time_str, last_time_str, last_second
     return current_date, last_time_str, last_seconds
 
 
-def load_iostat_text(text):
+def load_sar_disk_text(text):
     lines = [line.rstrip("\n") for line in text.splitlines() if line.strip()]
     if not lines:
         raise ValueError("File is empty")
@@ -556,7 +885,7 @@ def load_iostat_text(text):
         rows.append(parsed)
 
     if not rows:
-        raise ValueError("No iostat device rows found in file")
+        raise ValueError("No SAR disk device rows found in file")
 
     df = pd.DataFrame(rows)
     df["timestamp"] = pd.to_datetime(
@@ -571,9 +900,9 @@ def load_iostat_text(text):
     return df, machine_name
 
 
-def load_iostat_file(path):
-    with open(path, "r") as f:
-        return load_iostat_text(f.read())
+def load_sar_disk_file(path):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return load_sar_disk_text(f.read())
 
 
 def metric_menu_label(metric):
@@ -837,10 +1166,11 @@ class ViewerHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            df, machine_name = load_iostat_text(body)
+            df, machine_name = load_sar_disk_text(body)
             fig = builder(df, machine_name)
             payload = json.loads(fig.to_json())
             payload["config"] = PLOTLY_CONFIG
+            payload["machine_name"] = machine_name
             self._send_json(payload)
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=400)
