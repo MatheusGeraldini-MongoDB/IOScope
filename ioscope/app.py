@@ -221,16 +221,48 @@ PAGE_STYLE = """
     .local-db-panel {
       margin-top: 8px;
       margin-bottom: 16px;
-      padding: 14px 16px;
       border: 1px solid #d9dde3;
       border-radius: 8px;
       background: #fafbfc;
+      overflow: hidden;
     }
-    .local-db-heading {
-      margin: 0 0 6px;
+    .saved-logs-toggle {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      margin: 0;
       font-size: 1rem;
       font-weight: 600;
       color: #243b53;
+      background: #fafbfc;
+      border: none;
+      cursor: pointer;
+      text-align: left;
+      font-family: inherit;
+    }
+    .saved-logs-toggle:hover {
+      background: #f0f4f8;
+    }
+    .saved-logs-toggle:focus-visible {
+      outline: 2px solid #334e68;
+      outline-offset: -2px;
+    }
+    .saved-logs-chevron {
+      display: inline-block;
+      flex-shrink: 0;
+      transition: transform 0.15s ease;
+      font-size: 0.7rem;
+      color: #627d98;
+    }
+    .local-db-panel.is-expanded .saved-logs-chevron {
+      transform: rotate(90deg);
+    }
+    .local-db-panel-body {
+      padding: 0 16px 14px;
+      border-top: 1px solid #e4e7eb;
+      background: #fafbfc;
     }
     .local-db-hint {
       margin: 0 0 12px;
@@ -296,6 +328,17 @@ PAGE_SCRIPT = """
     let resizeTimer = null;
     let sqlDb = null;
     let sqlDbOpenPromise = null;
+
+    const savedLogsToggle = document.getElementById("saved-logs-toggle");
+    const savedLogsBody = document.getElementById("saved-logs-body");
+    const savedLogsPanel = document.getElementById("saved-logs-panel");
+
+    savedLogsToggle.addEventListener("click", () => {
+      const willExpand = savedLogsBody.hidden;
+      savedLogsBody.hidden = !willExpand;
+      savedLogsToggle.setAttribute("aria-expanded", willExpand ? "true" : "false");
+      savedLogsPanel.classList.toggle("is-expanded", willExpand);
+    });
 
     function idbOpen() {
       return new Promise((resolve, reject) => {
@@ -655,8 +698,12 @@ def page_html(title, page_heading, subtitle, active_nav, render_endpoint, chart_
     <div class="controls">
       <input id="file-input" type="file" accept=".txt,text/plain">
     </div>
-    <div class="local-db-panel">
-      <h2 class="local-db-heading">Saved logs (browser database)</h2>
+    <div class="local-db-panel" id="saved-logs-panel">
+      <button type="button" class="saved-logs-toggle" id="saved-logs-toggle" aria-expanded="false" aria-controls="saved-logs-body">
+        <span class="saved-logs-chevron" aria-hidden="true">▶</span>
+        <span>Saved logs (browser database)</span>
+      </button>
+      <div id="saved-logs-body" class="local-db-panel-body" hidden>
       <p class="local-db-hint">Each successful upload is stored locally. Pick one to reload it, or discard it to free space.</p>
       <div class="local-db-row">
         <label for="saved-list">Saved</label>
@@ -666,6 +713,7 @@ def page_html(title, page_heading, subtitle, active_nav, render_endpoint, chart_
         <button type="button" id="load-saved-btn">Load</button>
         <button type="button" id="discard-saved-btn" class="danger">Discard</button>
         <button type="button" id="refresh-saved-btn">Refresh list</button>
+      </div>
       </div>
     </div>
     <div id="status">No file selected.</div>
