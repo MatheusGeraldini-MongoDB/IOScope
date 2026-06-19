@@ -3,7 +3,7 @@ import re
 import webbrowser
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -16,6 +16,16 @@ METRIC_COLS = [
     "avrq_sz", "avgqu_sz", "await",
     "svctm", "pct_util",
 ]
+
+# Query param aggregate=… → pandas resample rule (mean per bucket).
+AGGREGATION_RULES = {
+    "none": None,
+    "": None,
+    "1min": "1min",
+    "5min": "5min",
+    "15min": "15min",
+    "1h": "1h",
+}
 
 # Field descriptions based on sar(1) (-d) and related sysstat SAR disk docs.
 METRIC_INFO = {
@@ -192,6 +202,26 @@ PAGE_STYLE = """
     input[type="file"] {
       font-size: 0.95rem;
     }
+    .aggregate-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      width: 100%;
+    }
+    .aggregate-row label {
+      font-size: 0.92rem;
+      color: #334e68;
+    }
+    #aggregate-interval {
+      flex: 1 1 220px;
+      min-width: 200px;
+      max-width: 100%;
+      padding: 6px 8px;
+      font-size: 0.92rem;
+      border-radius: 6px;
+      border: 1px solid #cbd2d9;
+    }
     #status {
       min-height: 1.25rem;
       margin-bottom: 12px;
@@ -316,6 +346,9 @@ PAGE_SCRIPT = """
     const chartEl = document.getElementById("chart");
     const renderEndpoint = "__RENDER_ENDPOINT__";
     const sqlJsDist = "__SQL_JS_DIST__";
+    const aggregateSelect = document.getElementById("aggregate-interval");
+    let lastLoadedText = "";
+    let lastLoadedName = "";
     /** Clear legacy sessionStorage keys from older IOScope versions. */
     const legacyContentKey = "ioscope-file-content";
     const legacyNameKey = "ioscope-file-name";
@@ -328,6 +361,13 @@ PAGE_SCRIPT = """
     let resizeTimer = null;
     let sqlDb = null;
     let sqlDbOpenPromise = null;
+
+    function renderUrl() {
+      const bucket = aggregateSelect ? aggregateSelect.value : "none";
+      const enc = encodeURIComponent((bucket || "none").trim());
+      const sep = renderEndpoint.indexOf("?") >= 0 ? "&" : "?";
+      return renderEndpoint + sep + "aggregate=" + enc;
+    }
 
     const savedLogsToggle = document.getElementById("saved-logs-toggle");
     const savedLogsBody = document.getElementById("saved-logs-body");
@@ -391,7 +431,9 @@ PAGE_SCRIPT = """
         file_name TEXT NOT NULL,
         file_content TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        host_name TEXT NOT NULL DEFAULT ''
+        host_name TEXT NOT NULL DEFAULT '',
+        period_start TEXT NOT NULL DEFAULT '',
+        period_end TEXT NOT NULL DEFAULT ''
       );`);
       const legacy = db.exec(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='current_file'",
@@ -403,7 +445,7 @@ PAGE_SCRIPT = """
           const fn = rows[0].values[0][0];
           const fc = rows[0].values[0][1];
           db.run(
-            "INSERT INTO saved_files (file_name, file_content, created_at, host_name) VALUES (?, ?, datetime('now'), '')",
+            "INSERT INTO saved_files (file_name, file_content, created_at, host_name, period_start, period_end) VALUES (?, ?, datetime('now'), '', '', '')",
             [fn, fc],
           );
         }
@@ -416,6 +458,14 @@ PAGE_SCRIPT = """
         const colNames = info[0].values.map((row) => row[1]);
         if (!colNames.includes("host_name")) {
           db.run("ALTER TABLE saved_files ADD COLUMN host_name TEXT NOT NULL DEFAULT ''");
+          needsPersist = true;
+        }
+        if (!colNames.includes("period_start")) {
+          db.run("ALTER TABLE saved_files ADD COLUMN period_start TEXT NOT NULL DEFAULT ''");
+          needsPersist = true;
+        }
+        if (!colNames.includes("period_end")) {
+          db.run("ALTER TABLE saved_files ADD COLUMN period_end TEXT NOT NULL DEFAULT ''");
           needsPersist = true;
         }
       }
@@ -452,12 +502,14 @@ PAGE_SCRIPT = """
       await idbPutSnapshot(exported);
     }
 
-    async function insertSavedFile(name, text, hostName) {
+    async function insertSavedFile(name, text, hostName, periodStart, periodEnd) {
       await ensureSqlDatabase();
       const host = hostName && String(hostName).trim() ? String(hostName).trim() : "";
+      const p0 = periodStart && String(periodStart).trim() ? String(periodStart).trim() : "";
+      const p1 = periodEnd && String(periodEnd).trim() ? String(periodEnd).trim() : "";
       sqlDb.run(
-        "INSERT INTO saved_files (file_name, file_content, created_at, host_name) VALUES (?, ?, datetime('now'), ?)",
-        [name, text, host],
+        "INSERT INTO saved_files (file_name, file_content, created_at, host_name, period_start, period_end) VALUES (?, ?, datetime('now'), ?, ?, ?)",
+        [name, text, host, p0, p1],
       );
       await persistDbToIdb();
     }
@@ -486,6 +538,21 @@ PAGE_SCRIPT = """
       return { name: row.n, text: row.t };
     }
 
+    function formatDataPeriod(isoStart, isoEnd) {
+      const a = isoStart && String(isoStart).trim();
+      const b = isoEnd && String(isoEnd).trim();
+      if (!a || !b) {
+        return "";
+      }
+      const d0 = new Date(a);
+      const d1 = new Date(b);
+      if (Number.isNaN(d0.getTime()) || Number.isNaN(d1.getTime())) {
+        return "";
+      }
+      const opts = { dateStyle: "short", timeStyle: "short" };
+      return d0.toLocaleString(undefined, opts) + " – " + d1.toLocaleString(undefined, opts);
+    }
+
     async function refreshSavedList() {
       const sel = document.getElementById("saved-list");
       if (!sel) {
@@ -494,18 +561,25 @@ PAGE_SCRIPT = """
       await ensureSqlDatabase();
       sel.innerHTML = '<option value="">— Select a saved log —</option>';
       const stmt = sqlDb.prepare(
-        "SELECT id, file_name, host_name, created_at, length(file_content) AS nbytes FROM saved_files ORDER BY id DESC",
+        "SELECT id, file_name, host_name, period_start, period_end, created_at, length(file_content) AS nbytes FROM saved_files ORDER BY id DESC",
       );
       while (stmt.step()) {
         const r = stmt.getAsObject();
         const mib = (r.nbytes / (1024 * 1024)).toFixed(2);
-        const hostPart =
-          r.host_name && String(r.host_name).trim()
-            ? String(r.host_name).trim() + " · "
-            : "";
+        const periodLabel = formatDataPeriod(r.period_start, r.period_end);
+        const parts = [];
+        if (r.host_name && String(r.host_name).trim()) {
+          parts.push(String(r.host_name).trim());
+        }
+        parts.push(r.file_name);
+        if (periodLabel) {
+          parts.push(periodLabel);
+        }
+        parts.push(r.created_at);
+        parts.push(mib + " MiB");
         const opt = document.createElement("option");
         opt.value = String(r.id);
-        opt.textContent = hostPart + r.file_name + " · " + r.created_at + " · " + mib + " MiB";
+        opt.textContent = parts.join(" · ");
         sel.appendChild(opt);
       }
       stmt.free();
@@ -530,7 +604,7 @@ PAGE_SCRIPT = """
     async function renderChart(fileText, fileName) {
       setStatus(`Loading ${fileName}...`);
 
-      const response = await fetch(renderEndpoint, {
+      const response = await fetch(renderUrl(), {
         method: "POST",
         headers: {"Content-Type": "text/plain; charset=utf-8"},
         body: fileText,
@@ -546,12 +620,32 @@ PAGE_SCRIPT = """
       resizeChart();
       const machineName =
         typeof payload.machine_name === "string" ? payload.machine_name.trim() : "";
-      setStatus(
-        machineName
-          ? `Showing ${fileName} (${machineName})`
-          : `Showing ${fileName}`,
-      );
-      return machineName;
+      const periodStart =
+        typeof payload.period_start === "string" ? payload.period_start.trim() : "";
+      const periodEnd =
+        typeof payload.period_end === "string" ? payload.period_end.trim() : "";
+      const periodFmt = formatDataPeriod(periodStart, periodEnd);
+      let statusMsg = machineName
+        ? `Showing ${fileName} (${machineName})`
+        : `Showing ${fileName}`;
+      if (periodFmt) {
+        statusMsg += " · " + periodFmt;
+      }
+      const bucket = aggregateSelect ? aggregateSelect.value : "none";
+      if (bucket && bucket !== "none") {
+        const bucketLabels = {
+          "1min": "1 min avg",
+          "5min": "5 min avg",
+          "15min": "15 min avg",
+          "1h": "1 h avg",
+        };
+        const bl = bucketLabels[bucket] || bucket;
+        statusMsg += " · " + bl;
+      }
+      setStatus(statusMsg);
+      lastLoadedText = fileText;
+      lastLoadedName = fileName;
+      return { machineName, periodStart, periodEnd };
     }
 
     window.addEventListener("resize", () => {
@@ -559,19 +653,41 @@ PAGE_SCRIPT = """
       resizeTimer = setTimeout(resizeChart, 150);
     });
 
+    if (aggregateSelect) {
+      aggregateSelect.addEventListener("change", async () => {
+        if (!lastLoadedText) {
+          setStatus("Load a SAR disk log first, then choose a time bucket.", true);
+          return;
+        }
+        try {
+          await renderChart(lastLoadedText, lastLoadedName);
+        } catch (error) {
+          setStatus(error.message, true);
+        }
+      });
+    }
+
     fileInput.addEventListener("change", async () => {
       const file = fileInput.files[0];
       if (!file) {
         setStatus("No file selected.");
         showPlaceholder();
+        lastLoadedText = "";
+        lastLoadedName = "";
         return;
       }
 
       try {
         const fileText = await file.text();
-        const machineName = await renderChart(fileText, file.name);
+        const meta = await renderChart(fileText, file.name);
         try {
-          await insertSavedFile(file.name, fileText, machineName);
+          await insertSavedFile(
+            file.name,
+            fileText,
+            meta.machineName,
+            meta.periodStart,
+            meta.periodEnd,
+          );
           await refreshSavedList();
           const sel = document.getElementById("saved-list");
           if (sel && sel.options.length > 1) {
@@ -624,6 +740,8 @@ PAGE_SCRIPT = """
         await deleteSavedFile(id);
         await refreshSavedList();
         sel.value = "";
+        lastLoadedText = "";
+        lastLoadedName = "";
         setStatus("Saved log removed.");
         showPlaceholder("Select a SAR disk log file or load a saved log.");
       } catch (error) {
@@ -697,6 +815,16 @@ def page_html(title, page_heading, subtitle, active_nav, render_endpoint, chart_
 {nav_lines}    </nav>
     <div class="controls">
       <input id="file-input" type="file" accept=".txt,text/plain">
+      <div class="aggregate-row">
+        <label for="aggregate-interval">Time bucket</label>
+        <select id="aggregate-interval" aria-label="Average metrics over this interval">
+          <option value="none" selected>Original (no averaging)</option>
+          <option value="1min">1 minute average</option>
+          <option value="5min">5 minute average</option>
+          <option value="15min">15 minute average</option>
+          <option value="1h">1 hour average</option>
+        </select>
+      </div>
     </div>
     <div class="local-db-panel" id="saved-logs-panel">
       <button type="button" class="saved-logs-toggle" id="saved-logs-toggle" aria-expanded="false" aria-controls="saved-logs-body">
@@ -953,6 +1081,60 @@ def load_sar_disk_file(path):
         return load_sar_disk_text(f.read())
 
 
+def apply_time_aggregation(df, aggregate_key):
+    """Average metric columns within fixed time buckets per device."""
+    key = (aggregate_key or "none").strip().lower()
+    if key in ("none", ""):
+        return df
+    rule = AGGREGATION_RULES.get(key)
+    if rule is None:
+        raise ValueError(
+            f"Unknown aggregation interval {aggregate_key!r}; "
+            "use none, 1min, 5min, 15min, or 1h."
+        )
+    if "timestamp" not in df.columns or "device" not in df.columns:
+        return df
+
+    dfx = df.sort_values(["device", "timestamp"]).copy()
+    agg_cols = [c for c in METRIC_COLS if c in dfx.columns]
+    if not agg_cols:
+        return df
+    # Resample on "timestamp" per device. Do not use group_keys=False — it can omit the
+    # device level from the result so reset_index() drops the "device" column (KeyError downstream).
+    out = (
+        dfx.groupby("device")
+        .resample(rule, on="timestamp")
+        .agg({c: "mean" for c in agg_cols})
+    )
+    out = out.reset_index()
+    metric_cols = [c for c in METRIC_COLS if c in out.columns]
+    if metric_cols:
+        out = out.dropna(subset=metric_cols, how="all")
+    if out.empty:
+        raise ValueError(
+            "Aggregation produced no rows for this interval; try a shorter bucket or Original."
+        )
+    return out
+
+
+def dataframe_timestamp_period(df):
+    """First and last sample timestamps as ISO strings for API and saved-log metadata."""
+    if "timestamp" not in df.columns or len(df.index) == 0:
+        return "", ""
+    ts = df["timestamp"]
+    try:
+        ts_min = ts.min()
+        ts_max = ts.max()
+    except (TypeError, ValueError):
+        return "", ""
+    if pd.isna(ts_min) or pd.isna(ts_max):
+        return "", ""
+    return (
+        pd.Timestamp(ts_min).isoformat(),
+        pd.Timestamp(ts_max).isoformat(),
+    )
+
+
 def metric_menu_label(metric):
     return METRIC_INFO[metric]["menu"]
 
@@ -1009,6 +1191,7 @@ def build_heatmap_pivot(df, metric, devices):
         .reindex(devices)
         .fillna(0)
         .sort_index()
+        .sort_index(axis=1)
     )
 
 
@@ -1023,7 +1206,7 @@ def heatmap_layout_size(devices):
 def apply_line_chart_xaxis(fig):
     fig.update_xaxes(
         title="Timestamp",
-        tickformat="%b %d %H:%M",
+        tickformat="%b %d %H:%M:%S",
         tickangle=-45,
         automargin=True,
         nticks=12,
@@ -1033,6 +1216,8 @@ def apply_line_chart_xaxis(fig):
 def apply_heatmap_xaxis(fig):
     fig.update_xaxes(
         title="Timestamp",
+        type="date",
+        tickformat="%b %d %H:%M:%S",
         tickangle=-45,
         automargin=True,
         nticks=12,
@@ -1064,7 +1249,7 @@ def build_line_chart(df, machine_name):
                     line=dict(color=style["color"], dash=style["dash"], width=style["width"]),
                     hovertemplate=(
                         "Device: %{fullData.name}<br>"
-                        "Time: %{x}<br>"
+                        "Time: %{x|%Y-%m-%d %H:%M:%S}<br>"
                         f"{metric}: %{{y:.4f}}<extra></extra>"
                     ),
                 )
@@ -1130,7 +1315,7 @@ def build_heatmap_chart(df, machine_name):
         fig.add_trace(
             go.Heatmap(
                 z=pivot.values.tolist(),
-                x=[ts.strftime("%Y-%m-%d %H:%M:%S") for ts in pivot.columns],
+                x=pivot.columns.to_list(),
                 y=device_labels,
                 colorscale="YlOrRd",
                 visible=(i == 0),
@@ -1138,7 +1323,7 @@ def build_heatmap_chart(df, machine_name):
                 name=metric,
                 hovertemplate=(
                     "Device: %{y}<br>"
-                    "Time: %{x}<br>"
+                    "Time: %{x|%Y-%m-%d %H:%M:%S}<br>"
                     f"{metric}: %{{z:.4f}}<extra></extra>"
                 ),
             )
@@ -1199,7 +1384,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace")
 
@@ -1214,11 +1400,19 @@ class ViewerHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            query = parse_qs(parsed.query)
+            agg_parts = query.get("aggregate", ["none"])
+            aggregate_key = agg_parts[0] if agg_parts else "none"
+
             df, machine_name = load_sar_disk_text(body)
+            df = apply_time_aggregation(df, aggregate_key)
             fig = builder(df, machine_name)
             payload = json.loads(fig.to_json())
             payload["config"] = PLOTLY_CONFIG
             payload["machine_name"] = machine_name
+            period_start, period_end = dataframe_timestamp_period(df)
+            payload["period_start"] = period_start
+            payload["period_end"] = period_end
             self._send_json(payload)
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=400)
